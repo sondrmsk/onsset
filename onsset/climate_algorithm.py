@@ -125,10 +125,16 @@ def detect_datatype_from_filename(filename: str) -> ClimateDataType:
 
 
 # Output column names (for integration with onsset.py)
-SET_CLIMATE_RISK = 'ClimateRisk'  # Compound risk score
-SET_CLIMATE_RISK_HEATWAVE = 'ClimateRiskHeatwave'  # Individual risk
-SET_CLIMATE_RISK_DROUGHT = 'ClimateRiskDrought'  # Individual risk
+SET_NORMALIZED_CLIMATE_HAZARD = 'NormalizedClimateHazard'  # Compound normalized hazard score
+SET_CLIMATE_HAZARD = 'ClimateHazard'  # Explicit hazard component (heatwave + drought)
+SET_CLIMATE_VULNERABILITY = 'ClimateVulnerability'  # Susceptibility component (wealth + remoteness)
+SET_CLIMATE_PRIORITY = 'ClimatePriority'  # Prioritization score: Hazard × Vulnerability
+SET_CLIMATE_RISK_HEATWAVE = 'ClimateRiskHeatwave'  # Individual heatwave hazard
+SET_CLIMATE_RISK_DROUGHT = 'ClimateRiskDrought'  # Individual drought hazard
 SET_ADMIN3_ID = 'Admin3ID'  # Municipality identifier
+
+# Deprecated: SET_CLIMATE_EXPOSURE no longer used (population accounts for scheduling, not priority)
+# Deprecated: SET_CLIMATE_RISK previously stored population-weighted risk; now use ClimatePriority
 
 # Global variable for detected temporal resolution
 _temporal_resolution: TemporalResolution = TemporalResolution.UNKNOWN
@@ -277,6 +283,9 @@ class ClimateDataLoader:
         # Legacy detected_columns dict (for backward compatibility)
         self.detected_columns: Dict[str, str] = {}
 
+        # Flag to prevent re-classification
+        self._files_classified: bool = False
+
     # -------------------------------------------------------------------------
     # Backward Compatibility Properties
     # -------------------------------------------------------------------------
@@ -310,6 +319,10 @@ class ClimateDataLoader:
 
     def _classify_files(self) -> None:
         """Classify files by temporal resolution AND data type independently."""
+        # Check if already classified to prevent duplicate entries
+        if self._files_classified:
+            return
+
         if not os.path.isdir(self.folder_path):
             raise ValueError(f"Climate data folder not found: {self.folder_path}")
 
@@ -337,6 +350,7 @@ class ClimateDataLoader:
             for datatype in self.classified_files[temporal]:
                 self.classified_files[temporal][datatype].sort()
 
+        self._files_classified = True
         self._log_classification_summary()
 
     def _apply_legacy_rules(
@@ -1203,6 +1217,7 @@ def _compute_spi_for_cell(
     scale: int,
     baseline_start: int,
     baseline_end: int,
+    baseline_params: Optional[Dict[int, Tuple[float, float, float]]] = None,
 ) -> pd.DataFrame:
     """Compute SPI-k for one grid cell.
 
@@ -1217,7 +1232,11 @@ def _compute_spi_for_cell(
     Returns:
         DataFrame with: date, year, month, P_k, spi
     """
-    df = df_cell.sort_values(date_col).set_index(date_col)
+    df = df_cell.sort_values(date_col).copy()
+
+    # Drop duplicate dates (keep first occurrence), then set index
+    df = df.drop_duplicates(subset=[date_col], keep='first')
+    df = df.set_index(date_col)
 
     # Full continuous monthly index
     full_index = pd.date_range(df.index.min(), df.index.max(), freq='MS')
@@ -1240,28 +1259,31 @@ def _compute_spi_for_cell(
 
         series = df.loc[mask_month, 'P_k']
 
-        # Baseline subset for fitting
-        baseline_mask = (
-            mask_month &
-            (df['year'] >= baseline_start) &
-            (df['year'] <= baseline_end)
-        )
-        baseline_values = df.loc[baseline_mask, 'P_k'].dropna()
+        if baseline_params is not None and m in baseline_params:
+            shape, scale_param, q = baseline_params[m]
+        else:
+            # Fallback to cell-specific baseline subset for fitting
+            baseline_mask = (
+                mask_month &
+                (df['year'] >= baseline_start) &
+                (df['year'] <= baseline_end)
+            )
+            baseline_values = df.loc[baseline_mask, 'P_k'].dropna()
 
-        if len(baseline_values) < 10:
-            continue
+            if len(baseline_values) < 10:
+                continue
 
-        positive = baseline_values[baseline_values > 0]
-        if len(positive) < 2:
-            continue
+            positive = baseline_values[baseline_values > 0]
+            if len(positive) < 2:
+                continue
 
-        # Gamma fit: shape, loc=0, scale
-        try:
-            shape, loc, scale_param = gamma.fit(positive, floc=0)
-        except Exception:
-            continue
+            # Gamma fit: shape, loc=0, scale
+            try:
+                shape, loc, scale_param = gamma.fit(positive, floc=0)
+            except Exception:
+                continue
 
-        q = len(positive) / len(baseline_values)  # non-zero probability
+            q = len(positive) / len(baseline_values)  # non-zero probability
 
         x = series.values
         x_clipped = np.maximum(x, 0.0001)
@@ -1279,6 +1301,55 @@ def _compute_spi_for_cell(
 
     df = df.dropna(subset=['P_k', 'spi']).reset_index().rename(columns={'index': 'date'})
     return df[['date', 'year', 'month', 'P_k', 'spi']]
+
+
+def _fit_countrywide_spi_baseline(
+    climate_df: pd.DataFrame,
+    lat_col: str,
+    lon_col: str,
+    date_col: str,
+    precip_col: str,
+    scale: int,
+    baseline_start: int,
+    baseline_end: int,
+) -> Dict[int, Tuple[float, float, float]]:
+    """Fit month-wise SPI baseline parameters using all cells countrywide.
+
+    Returns a dict mapping month -> (shape, scale_param, q_nonzero).
+    """
+    df = climate_df[[lat_col, lon_col, date_col, precip_col]].copy()
+    df = df.sort_values([lat_col, lon_col, date_col])
+    df['year'] = df[date_col].dt.year
+    df['month'] = df[date_col].dt.month
+
+    # Build SPI-k precipitation sums for each cell using available monthly sequence.
+    df['P_k'] = (
+        df.groupby([lat_col, lon_col], sort=False)[precip_col]
+        .transform(lambda s: s.rolling(window=scale, min_periods=scale).sum())
+    )
+
+    baseline_mask = (df['year'] >= baseline_start) & (df['year'] <= baseline_end)
+    baseline_df = df.loc[baseline_mask, ['month', 'P_k']].dropna()
+
+    baseline_params: Dict[int, Tuple[float, float, float]] = {}
+    for m in range(1, 13):
+        vals = baseline_df.loc[baseline_df['month'] == m, 'P_k']
+        if len(vals) < 10:
+            continue
+
+        positive = vals[vals > 0]
+        if len(positive) < 2:
+            continue
+
+        try:
+            shape, loc, scale_param = gamma.fit(positive, floc=0)
+        except Exception:
+            continue
+
+        q = len(positive) / len(vals)
+        baseline_params[m] = (shape, scale_param, q)
+
+    return baseline_params
 
 
 def calculate_spi_drought_risk(
@@ -1342,6 +1413,27 @@ def calculate_spi_drought_risk(
     baseline_start = int(config['spi_baseline_start'])
     baseline_end = int(config['spi_baseline_end'])
 
+    # Fit a countrywide monthly SPI baseline (shared across all cells).
+    baseline_params = _fit_countrywide_spi_baseline(
+        climate_df=df,
+        lat_col=lat_col,
+        lon_col=lon_col,
+        date_col=date_col,
+        precip_col=precip_col,
+        scale=spi_scale,
+        baseline_start=baseline_start,
+        baseline_end=baseline_end,
+    )
+    if baseline_params:
+        logger.info(
+            f"Using countrywide SPI baseline from {baseline_start} to {baseline_end} "
+            f"for months: {sorted(baseline_params.keys())}"
+        )
+    else:
+        logger.warning(
+            "Could not fit countrywide SPI baseline; falling back to cell-specific baseline fitting"
+        )
+
     grouped_cells = df.groupby([lat_col, lon_col], sort=False)
     logger.info(f"Computing SPI-{spi_scale} for {len(grouped_cells)} grid cells...")
 
@@ -1349,7 +1441,8 @@ def calculate_spi_drought_risk(
     for (lat, lon), df_cell in grouped_cells:
         spi_df = _compute_spi_for_cell(
             df_cell, date_col, precip_col,
-            spi_scale, baseline_start, baseline_end
+            spi_scale, baseline_start, baseline_end,
+            baseline_params=baseline_params if baseline_params else None,
         )
         if spi_df.empty:
             continue
@@ -1532,6 +1625,10 @@ def map_risk_to_settlements(
 ) -> pd.DataFrame:
     """Map climate risk from admin-3 regions to settlements.
 
+    Computes climate prioritization score: Priority = Hazard × Vulnerability
+    Population is NOT included in the priority score because it is already accounted
+    for by the electrification rollout rule (fixed % targets per timestep).
+
     Args:
         settlements_df: OnSSET settlements DataFrame.
         risk_df: DataFrame with risk scores per admin3.
@@ -1541,7 +1638,11 @@ def map_risk_to_settlements(
         lon_col: Name of longitude column in settlements.
 
     Returns:
-        Settlements DataFrame with risk columns added.
+        Settlements DataFrame with climate columns added:
+        - ClimateHazard: Compound hazard (heatwave + drought)
+        - ClimateVulnerability: Susceptibility (wealth + remoteness)
+        - ClimatePriority: Final prioritization score (Hazard × Vulnerability)
+        - ClimateRiskHeatwave, ClimateRiskDrought: Individual hazards
     """
     admin3_id_col = config['admin3_id_column']
 
@@ -1580,14 +1681,59 @@ def map_risk_to_settlements(
 
     # Rename columns for OnSSET integration
     if 'compound_risk' in settlements_df.columns:
-        settlements_df[SET_CLIMATE_RISK] = settlements_df['compound_risk']
+        hazard_values = pd.to_numeric(settlements_df['compound_risk'], errors='coerce')
+        hazard_min = hazard_values.min()
+        hazard_max = hazard_values.max()
+        if pd.notna(hazard_min) and pd.notna(hazard_max) and hazard_max > hazard_min:
+            hazard_values = (hazard_values - hazard_min) / (hazard_max - hazard_min)
+        else:
+            hazard_values = hazard_values.fillna(0)
+
+        # Store normalized hazard component (keep legacy name for backward compatibility)
+        settlements_df[SET_NORMALIZED_CLIMATE_HAZARD] = hazard_values
+        settlements_df[SET_CLIMATE_HAZARD] = hazard_values
+
+        # Compute Vulnerability component: ((1 - normalized_wealth) + normalized_travel) / 2
+        # Try multiple column name variants for robustness
+        wealth_col = next((col for col in [
+            'NormalizedRelativeWealth',
+            'normalized_wealth_index',
+            'NormalizedWealth',
+            'normalized_relative_wealth',
+        ] if col in settlements_df.columns), None)
+
+        travel_col = next((col for col in [
+            'NormalizedTravelHours',
+            'normalized_travel_hours',
+            'NormalizedTravel',
+        ] if col in settlements_df.columns), None)
+
+        if wealth_col and travel_col:
+            wealth_values = pd.to_numeric(settlements_df[wealth_col], errors='coerce').fillna(0)
+            travel_values = pd.to_numeric(settlements_df[travel_col], errors='coerce').fillna(0)
+            # Vulnerability: invert wealth (high wealth = low vulnerability), average with travel
+            vulnerability_values = ((1 - wealth_values) + travel_values) / 2
+            settlements_df[SET_CLIMATE_VULNERABILITY] = vulnerability_values
+        else:
+            # Fallback: if wealth/travel missing, set vulnerability to neutral (0.5)
+            vulnerability_values = pd.Series(0.5, index=settlements_df.index)
+            logger.warning("Wealth or travel columns not found; using neutral vulnerability value 0.5")
+            settlements_df[SET_CLIMATE_VULNERABILITY] = vulnerability_values
+
+        # Compute Climate Priority: Hazard × Vulnerability
+        # NOTE: Population is NOT included here. Population affects WHEN targets are reached
+        # (cumulative % targets per timestep), not WHO should be prioritized first.
+        priority_values = hazard_values * vulnerability_values
+        settlements_df[SET_CLIMATE_PRIORITY] = priority_values
+
     if 'heatwave_risk' in settlements_df.columns:
         settlements_df[SET_CLIMATE_RISK_HEATWAVE] = settlements_df['heatwave_risk']
     if 'drought_risk' in settlements_df.columns:
         settlements_df[SET_CLIMATE_RISK_DROUGHT] = settlements_df['drought_risk']
 
     # Fill NaN with 0 (settlements outside coverage)
-    for col in [SET_CLIMATE_RISK, SET_CLIMATE_RISK_HEATWAVE, SET_CLIMATE_RISK_DROUGHT]:
+    for col in [SET_NORMALIZED_CLIMATE_HAZARD, SET_CLIMATE_HAZARD,
+                SET_CLIMATE_VULNERABILITY, SET_CLIMATE_PRIORITY, SET_CLIMATE_RISK_HEATWAVE, SET_CLIMATE_RISK_DROUGHT]:
         if col in settlements_df.columns:
             settlements_df[col] = settlements_df[col].fillna(0)
 
@@ -1754,8 +1900,10 @@ def get_temporal_resolution() -> TemporalResolution:
 def get_risk_column_names() -> Dict[str, str]:
     """Get dictionary of risk column names for use in onsset.py."""
     return {
+        'normalized_hazard': SET_NORMALIZED_CLIMATE_HAZARD,
         'compound': SET_CLIMATE_RISK,
         'heatwave': SET_CLIMATE_RISK_HEATWAVE,
         'drought': SET_CLIMATE_RISK_DROUGHT,
         'admin3_id': SET_ADMIN3_ID,
     }
+

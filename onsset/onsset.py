@@ -15,14 +15,23 @@ try:
 except:
     from onsset.hybrids_wind import *
 
-# Import climate risk column constant
+# Import climate hazard column constants
 try:
-    from onsset.climate_algorithm import SET_CLIMATE_RISK
+    from onsset.climate_algorithm import (
+        SET_CLIMATE_PRIORITY, SET_NORMALIZED_CLIMATE_HAZARD,
+        SET_CLIMATE_HAZARD, SET_CLIMATE_VULNERABILITY
+    )
 except ImportError:
     try:
-        from climate_algorithm import SET_CLIMATE_RISK
+        from climate_algorithm import (
+            SET_CLIMATE_PRIORITY, SET_NORMALIZED_CLIMATE_HAZARD,
+            SET_CLIMATE_HAZARD, SET_CLIMATE_VULNERABILITY
+        )
     except ImportError:
-        SET_CLIMATE_RISK = 'ClimateRisk'  # Fallback if climate module not available
+        SET_CLIMATE_PRIORITY = 'ClimatePriority'  # Backward-compatible fallback
+        SET_NORMALIZED_CLIMATE_HAZARD = 'NormalizedClimateHazard'
+        SET_CLIMATE_HAZARD = 'ClimateHazard'
+        SET_CLIMATE_VULNERABILITY = 'ClimateVulnerability'
 
 import geojson
 from shapely.geometry import shape, Point
@@ -47,6 +56,9 @@ SET_GRID_DIST_PLANNED = 'GridDistPlan'  # Distance in km from current and future
 SET_ROAD_DIST = 'RoadDist'  # Distance in km from road network
 SET_NIGHT_LIGHTS = 'NightLights'  # Intensity of night time lights (from NASA), range 0 - 63
 SET_TRAVEL_HOURS = 'TravelHours'  # Travel time to large city in hours
+SET_NORMALIZED_RELATIVE_WEALTH = 'NormalizedRelativeWealth'
+SET_NORMALIZED_TRAVEL_HOURS = 'NormalizedTravelHours'
+SET_NORMALIZED_VULNERABILITY_SCORE = 'NormalizedVulnerabilityScore'
 SET_GHI = 'GHI'  # Global horizontal irradiance in kWh/m2/day
 SET_WINDVEL = 'WindVel'  # Wind velocity in m/s
 SET_WINDCF = 'WindCF'  # Wind capacity factor as percentage (range 0 - 1)
@@ -2842,16 +2854,28 @@ class SettlementProcessor:
                                         SET_ROAD_DIST], inplace=True)
 
             elif prio_choice == 6:
-                # Climate risk prioritization: high risk = high priority (electrify first)
-                # Multiply by -1 so that higher risk values come first when sorting ascending
-                if SET_CLIMATE_RISK in self.df.columns:
-                    self.df['ClimateRiskSort'] = self.df[SET_CLIMATE_RISK] * -1
+                # Climate-based prioritization: sort by ClimatePriority = Hazard × Vulnerability.
+                # Population is not included in priority score as it affects WHEN targets are reached
+                # (cumulative % thresholds), not WHO is prioritized. Hazardous, low-density areas may
+                # be deferred until later timesteps if population thresholds are met elsewhere.
+
+                climate_priority_col = next((col for col in [
+                    SET_CLIMATE_PRIORITY,
+                    'ClimatePriority',
+                    'climate_priority',
+                ] if col in self.df.columns), None)
+
+                if climate_priority_col:
+                    climate_priority_values = pd.to_numeric(self.df[climate_priority_col], errors='coerce').fillna(0)
+                    self.df[SET_NORMALIZED_VULNERABILITY_SCORE] = climate_priority_values
+                    # Multiply by -1 so that higher values come first when sorting ascending.
+                    self.df['VulnerabilitySort'] = self.df[SET_NORMALIZED_VULNERABILITY_SCORE] * -1
                     self.df.sort_values(by=[SET_ELEC_FINAL_CODE + "{}".format(year - time_step),
                                             'Intensification',
-                                            'ClimateRiskSort'], inplace=True)
-                    del self.df['ClimateRiskSort']
+                                            'VulnerabilitySort'], inplace=True)
+                    del self.df['VulnerabilitySort']
                 else:
-                    logging.warning('Climate risk column not found, falling back to population-based prioritization')
+                    logging.warning('ClimatePriority column not found; falling back to population-based prioritization')
                     self.df.sort_values(by=[SET_ELEC_FINAL_CODE + "{}".format(year - time_step),
                                             SET_POP + "{}".format(year)], inplace=True)
 
