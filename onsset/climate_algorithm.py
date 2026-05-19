@@ -28,33 +28,17 @@ import geopandas as gpd
 from shapely.geometry import Point
 from scipy.stats import gamma, norm
 
-# Import specs constants for climate configuration
+# Per-hazard risk calculators (moved to climate_calculations/ for modularity).
+# Each module also exposes a CONFIG_SCHEMA so its parameters travel with the
+# calculator — see the HAZARD_MODULES registration below.
 try:
-    from onsset.specs import (
-        SPE_CLIM_HW_THRESHOLD, SPE_CLIM_HW_DURATION, SPE_CLIM_HW_TEMP_COL,
-        SPE_CLIM_HW_CAT1_LOW, SPE_CLIM_HW_CAT1_HIGH, SPE_CLIM_HW_CAT2_LOW,
-        SPE_CLIM_HW_CAT2_HIGH, SPE_CLIM_HW_CAT3_LOW, SPE_CLIM_HW_CAT3_HIGH,
-        SPE_CLIM_HW_CAT4_LOW, SPE_CLIM_SPI_SCALE, SPE_CLIM_SPI_BASELINE_START,
-        SPE_CLIM_SPI_BASELINE_END, SPE_CLIM_SPI_PRECIP_COL,
-        SPE_CLIM_SPI_DROUGHT_THRESHOLD, SPE_CLIM_SPI_MILD_THRESHOLD,
-        SPE_CLIM_SPI_MODERATE_THRESHOLD, SPE_CLIM_SPI_SEVERE_THRESHOLD,
-        SPE_CLIM_LAT_COL, SPE_CLIM_LON_COL, SPE_CLIM_DATE_COL,
-        SPE_CLIM_ADMIN3_ID_COL, SPE_CLIM_ADMIN3_NAME_COL,
-        SPE_CLIM_HW_WEIGHT, SPE_CLIM_DROUGHT_WEIGHT
-    )
+    from onsset.climate_calculations import heatwave_calculation, drought_calculation
 except ImportError:
-    from specs import (
-        SPE_CLIM_HW_THRESHOLD, SPE_CLIM_HW_DURATION, SPE_CLIM_HW_TEMP_COL,
-        SPE_CLIM_HW_CAT1_LOW, SPE_CLIM_HW_CAT1_HIGH, SPE_CLIM_HW_CAT2_LOW,
-        SPE_CLIM_HW_CAT2_HIGH, SPE_CLIM_HW_CAT3_LOW, SPE_CLIM_HW_CAT3_HIGH,
-        SPE_CLIM_HW_CAT4_LOW, SPE_CLIM_SPI_SCALE, SPE_CLIM_SPI_BASELINE_START,
-        SPE_CLIM_SPI_BASELINE_END, SPE_CLIM_SPI_PRECIP_COL,
-        SPE_CLIM_SPI_DROUGHT_THRESHOLD, SPE_CLIM_SPI_MILD_THRESHOLD,
-        SPE_CLIM_SPI_MODERATE_THRESHOLD, SPE_CLIM_SPI_SEVERE_THRESHOLD,
-        SPE_CLIM_LAT_COL, SPE_CLIM_LON_COL, SPE_CLIM_DATE_COL,
-        SPE_CLIM_ADMIN3_ID_COL, SPE_CLIM_ADMIN3_NAME_COL,
-        SPE_CLIM_HW_WEIGHT, SPE_CLIM_DROUGHT_WEIGHT
-    )
+    from climate_calculations import heatwave_calculation, drought_calculation
+
+calculate_heatwave_risk = heatwave_calculation.calculate_heatwave_risk
+calculate_heatwave_risk_incremental = heatwave_calculation.calculate_heatwave_risk_incremental
+calculate_spi_drought_risk = drought_calculation.calculate_spi_drought_risk
 
 logging.basicConfig(format='%(asctime)s\t\t%(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -141,47 +125,55 @@ _temporal_resolution: TemporalResolution = TemporalResolution.UNKNOWN
 
 
 # =============================================================================
-# DEFAULT CONFIGURATION VALUES
+# CONFIGURATION SCHEMA
 # =============================================================================
+# Per-hazard parameters are owned by each climate_calculations/<hazard>.py
+# module via its CONFIG_SCHEMA attribute. To add a new hazard (e.g. flood):
+#   1. Add climate_calculations/flood_calculation.py with a CONFIG_SCHEMA dict
+#   2. Append the module to HAZARD_MODULES below
+# Nothing in specs.py needs to change.
 
-DEFAULT_CONFIG = {
-    # Heatwave defaults
-    'heatwave_threshold_c': 32.0,
-    'heatwave_duration_days': 3,
-    'temp_column': 't2m_max_C',
-    'hw_cat1_low': 32.0,
-    'hw_cat1_high': 35.0,
-    'hw_cat2_low': 35.0,
-    'hw_cat2_high': 38.0,
-    'hw_cat3_low': 38.0,
-    'hw_cat3_high': 42.0,
-    'hw_cat4_low': 42.0,
+# Name of the Excel sheet that holds climate config overrides. A hazard module
+# may override this per-schema via the 'spec_sheet' key.
+CLIMATE_CONFIG_SHEET = 'ClimateData'
 
-    # SPI defaults
-    'spi_scale': 3,
-    'spi_baseline_start': 1950,
-    'spi_baseline_end': 2000,
-    'precip_column': 'tp_mm_month',
-    'spi_drought_threshold': -1.0,
-    'spi_mild_threshold': -1.5,
-    'spi_moderate_threshold': -2.0,
-    'spi_severe_threshold': -2.5,
+# Row index (0-based) within the sheet to read. A hazard module may override
+# via the 'spec_row' key on its schema.
+CLIMATE_CONFIG_ROW = 0
 
-    # Common defaults
-    'lat_column': 'latitude',
-    'lon_column': 'longitude',
-    'date_column': 'date',
-    'admin3_id_column': 'GID_3',
-    'admin3_name_column': 'NAME_3',
-
-    # Risk weights
-    'heatwave_weight': 0.5,
-    'drought_weight': 0.5,
+# Shared parameters used by the loader, spatial join, and any hazard module.
+COMMON_CONFIG_SCHEMA = {
+    'fields': {
+        'lat_column':         ('LatitudeColumnName',  'latitude'),
+        'lon_column':         ('LongitudeColumnName', 'longitude'),
+        'date_column':        ('DateColumnName',      'date'),
+        'admin3_id_column':   ('Admin3IDColumn',      'GID_3'),
+        'admin3_name_column': ('Admin3NameColumn',    'NAME_3'),
+    },
 }
+
+# Registered hazard modules. Each module must expose a CONFIG_SCHEMA dict.
+HAZARD_MODULES = [heatwave_calculation, drought_calculation]
+
+
+def _iter_schemas():
+    """Yield (schema_dict, sheet_name, row_idx) for common + every registered hazard."""
+    yield COMMON_CONFIG_SCHEMA, CLIMATE_CONFIG_SHEET, CLIMATE_CONFIG_ROW
+    for module in HAZARD_MODULES:
+        schema = module.CONFIG_SCHEMA
+        yield (
+            schema,
+            schema.get('spec_sheet', CLIMATE_CONFIG_SHEET),
+            schema.get('spec_row', CLIMATE_CONFIG_ROW),
+        )
 
 
 def load_climate_config(specs_path: Optional[str] = None) -> Dict:
     """Load climate configuration from specs file or use defaults.
+
+    Iterates the common schema and every registered hazard schema to build the
+    merged config dict, then overrides values from the specs Excel file when
+    present.
 
     Args:
         specs_path: Path to specs Excel file. If None, use defaults.
@@ -189,58 +181,36 @@ def load_climate_config(specs_path: Optional[str] = None) -> Dict:
     Returns:
         Dictionary with configuration values.
     """
-    config = DEFAULT_CONFIG.copy()
+    # Start from defaults declared in each schema.
+    config: Dict = {}
+    for schema, _, _ in _iter_schemas():
+        for key, (_, default) in schema['fields'].items():
+            config[key] = default
 
     if specs_path is None or not os.path.exists(specs_path):
         logger.info("Using default climate configuration values")
         return config
 
-    try:
-        climate_data = pd.read_excel(specs_path, sheet_name='ClimateData')
-        if climate_data.empty:
-            logger.warning("ClimateData sheet is empty, using defaults")
-            return config
+    # Group schemas by (sheet, row) so each sheet is read at most once.
+    by_sheet: Dict[Tuple[str, int], List[Tuple[str, str]]] = defaultdict(list)
+    for schema, sheet, row_idx in _iter_schemas():
+        for key, (spec_col, _) in schema['fields'].items():
+            by_sheet[(sheet, row_idx)].append((spec_col, key))
 
-        row = climate_data.iloc[0]
+    for (sheet, row_idx), entries in by_sheet.items():
+        try:
+            sheet_df = pd.read_excel(specs_path, sheet_name=sheet)
+            if sheet_df.empty or row_idx >= len(sheet_df):
+                logger.warning(f"Sheet '{sheet}' has no row {row_idx}, using defaults for its fields")
+                continue
+            row = sheet_df.iloc[row_idx]
+            for spec_col, config_key in entries:
+                if spec_col in row.index and pd.notna(row[spec_col]):
+                    config[config_key] = row[spec_col]
+        except Exception as e:
+            logger.warning(f"Failed to load sheet '{sheet}': {e}. Using defaults for its fields.")
 
-        # Map specs columns to config keys
-        mappings = {
-            SPE_CLIM_HW_THRESHOLD: 'heatwave_threshold_c',
-            SPE_CLIM_HW_DURATION: 'heatwave_duration_days',
-            SPE_CLIM_HW_TEMP_COL: 'temp_column',
-            SPE_CLIM_HW_CAT1_LOW: 'hw_cat1_low',
-            SPE_CLIM_HW_CAT1_HIGH: 'hw_cat1_high',
-            SPE_CLIM_HW_CAT2_LOW: 'hw_cat2_low',
-            SPE_CLIM_HW_CAT2_HIGH: 'hw_cat2_high',
-            SPE_CLIM_HW_CAT3_LOW: 'hw_cat3_low',
-            SPE_CLIM_HW_CAT3_HIGH: 'hw_cat3_high',
-            SPE_CLIM_HW_CAT4_LOW: 'hw_cat4_low',
-            SPE_CLIM_SPI_SCALE: 'spi_scale',
-            SPE_CLIM_SPI_BASELINE_START: 'spi_baseline_start',
-            SPE_CLIM_SPI_BASELINE_END: 'spi_baseline_end',
-            SPE_CLIM_SPI_PRECIP_COL: 'precip_column',
-            SPE_CLIM_SPI_DROUGHT_THRESHOLD: 'spi_drought_threshold',
-            SPE_CLIM_SPI_MILD_THRESHOLD: 'spi_mild_threshold',
-            SPE_CLIM_SPI_MODERATE_THRESHOLD: 'spi_moderate_threshold',
-            SPE_CLIM_SPI_SEVERE_THRESHOLD: 'spi_severe_threshold',
-            SPE_CLIM_LAT_COL: 'lat_column',
-            SPE_CLIM_LON_COL: 'lon_column',
-            SPE_CLIM_DATE_COL: 'date_column',
-            SPE_CLIM_ADMIN3_ID_COL: 'admin3_id_column',
-            SPE_CLIM_ADMIN3_NAME_COL: 'admin3_name_column',
-            SPE_CLIM_HW_WEIGHT: 'heatwave_weight',
-            SPE_CLIM_DROUGHT_WEIGHT: 'drought_weight',
-        }
-
-        for spec_col, config_key in mappings.items():
-            if spec_col in row.index and pd.notna(row[spec_col]):
-                config[config_key] = row[spec_col]
-
-        logger.info("Loaded climate configuration from specs file")
-
-    except Exception as e:
-        logger.warning(f"Failed to load ClimateData sheet: {e}. Using defaults.")
-
+    logger.info("Loaded climate configuration from specs file")
     return config
 
 
@@ -833,727 +803,6 @@ class ClimateDataLoader:
         logger.info(f"Detected temporal resolution: {_temporal_resolution.value} "
                    f"(median diff: {median_diff_hours:.1f} hours)")
         return _temporal_resolution
-
-
-# =============================================================================
-# HEATWAVE RISK CALCULATION
-# =============================================================================
-
-def calculate_heatwave_risk(
-    climate_df: pd.DataFrame,
-    admin3_gdf: gpd.GeoDataFrame,
-    config: Dict,
-    detected_columns: Dict[str, str]
-) -> pd.DataFrame:
-    """Calculate heatwave risk scores per admin-3 region.
-
-    This function:
-    1. Assigns climate data points to admin-3 regions via spatial join
-    2. Calculates region-mean daily max temperatures
-    3. Counts heatwave days (temp > threshold)
-    4. Calculates 3-day rolling mean temperatures and categorizes
-    5. Produces normalized risk score (0-1)
-
-    Args:
-        climate_df: DataFrame with daily temperature data.
-        admin3_gdf: GeoDataFrame with admin-3 boundaries.
-        config: Configuration dictionary.
-        detected_columns: Dict mapping standard names to actual column names.
-
-    Returns:
-        DataFrame with columns: admin3_id, admin3_name, heatwave_risk (0-1)
-    """
-    logger.info("Calculating heatwave risk...")
-
-    lat_col = detected_columns.get('latitude')
-    lon_col = detected_columns.get('longitude')
-    date_col = detected_columns.get('date')
-    temp_col = detected_columns.get('temperature')
-    admin3_id_col = config['admin3_id_column']
-    admin3_name_col = config['admin3_name_column']
-
-    if temp_col is None or temp_col not in climate_df.columns:
-        logger.warning("No temperature column found, skipping heatwave calculation")
-        return pd.DataFrame(columns=[admin3_id_col, admin3_name_col, 'heatwave_risk'])
-
-    # Build cell-to-region lookup
-    cells = climate_df[[lat_col, lon_col]].drop_duplicates().reset_index(drop=True)
-    gdf_cells = gpd.GeoDataFrame(
-        cells,
-        geometry=gpd.points_from_xy(cells[lon_col], cells[lat_col]),
-        crs="EPSG:4326"
-    )
-
-    # Ensure admin3 is in correct CRS
-    if admin3_gdf.crs is None or admin3_gdf.crs.to_epsg() != 4326:
-        admin3_gdf = admin3_gdf.to_crs(epsg=4326)
-
-    gdf_join = gpd.sjoin(
-        gdf_cells,
-        admin3_gdf[[admin3_id_col, admin3_name_col, 'geometry']],
-        how="inner",
-        predicate="within"
-    )
-
-    cell_region_lookup = gdf_join[[lat_col, lon_col, admin3_id_col, admin3_name_col]].copy()
-    logger.info(f"Cell-region lookup rows: {len(cell_region_lookup)}")
-
-    # Parse dates and merge with region lookup
-    df = climate_df.copy()
-    df[date_col] = pd.to_datetime(df[date_col])
-    df = df.merge(cell_region_lookup, on=[lat_col, lon_col], how='left')
-    df = df.dropna(subset=[admin3_id_col])
-
-    if df.empty:
-        logger.warning("No data after spatial join, returning empty heatwave risk")
-        return pd.DataFrame(columns=[admin3_id_col, admin3_name_col, 'heatwave_risk'])
-
-    df['year'] = df[date_col].dt.year
-    years = sorted(df['year'].unique())
-
-    # Region accumulators
-    region_stats = defaultdict(lambda: {
-        'heatwave_days_total': 0,
-        'years_with_data': 0,
-        'max3day_list': [],
-    })
-
-    hw_threshold = config['heatwave_threshold_c']
-
-    for year in years:
-        df_year = df[df['year'] == year].copy()
-        if df_year.empty:
-            continue
-
-        # Region-mean daily max temperature
-        reg_day = (
-            df_year.groupby([admin3_id_col, admin3_name_col, date_col], as_index=False)[temp_col]
-            .mean()
-            .rename(columns={temp_col: 'tmax_reg_C'})
-        )
-
-        # Count heatwave days (temp > threshold)
-        hw_mask = reg_day['tmax_reg_C'] > hw_threshold
-        hw_days = (
-            reg_day[hw_mask]
-            .groupby([admin3_id_col, admin3_name_col], as_index=False)[date_col]
-            .nunique()
-            .rename(columns={date_col: 'heatwave_days_year'})
-        )
-        hw_days_dict = {
-            (row[admin3_id_col], row[admin3_name_col]): int(row['heatwave_days_year'])
-            for _, row in hw_days.iterrows()
-        }
-
-        # Max 3-day rolling mean per region
-        max3day_this_year = {}
-        for (gid, name), df_reg in reg_day.groupby([admin3_id_col, admin3_name_col], sort=False):
-            s = df_reg.sort_values(date_col).set_index(date_col)['tmax_reg_C']
-            if len(s) < 3:
-                continue
-            roll3 = s.rolling(window=3, min_periods=3).mean()
-            max_val = float(roll3.max())
-            if np.isfinite(max_val):
-                max3day_this_year[(gid, name)] = max_val
-
-        # Update accumulators
-        regions_in_year = set(
-            tuple(x) for x in reg_day[[admin3_id_col, admin3_name_col]].drop_duplicates().values
-        )
-
-        for key in regions_in_year:
-            gid, name = key
-            stats = region_stats[key]
-            stats['heatwave_days_total'] += hw_days_dict.get(key, 0)
-            stats['years_with_data'] += 1
-            if key in max3day_this_year:
-                stats['max3day_list'].append(max3day_this_year[key])
-
-    # Build stats DataFrame
-    rows = []
-    for (gid, name), stats in region_stats.items():
-        years_count = stats['years_with_data']
-        if years_count == 0:
-            mean_hw_days = 0
-            mean_max3day = 0
-        else:
-            mean_hw_days = stats['heatwave_days_total'] / years_count
-            mean_max3day = (
-                float(np.mean(stats['max3day_list']))
-                if stats['max3day_list'] else 0
-            )
-
-        rows.append({
-            admin3_id_col: gid,
-            admin3_name_col: name,
-            'mean_heatwave_days_per_year': mean_hw_days,
-            'mean_max_3day_T_C': mean_max3day,
-            'years_with_data': years_count,
-        })
-
-    df_heat = pd.DataFrame(rows)
-
-    if df_heat.empty:
-        logger.warning("No heatwave stats computed")
-        return pd.DataFrame(columns=[admin3_id_col, admin3_name_col, 'heatwave_risk'])
-
-    # Normalize to 0-1 risk score using min-max normalization
-    # NOTE: Using min-max normalization. Consider revisiting for percentile-based approach.
-    hw_days_col = 'mean_heatwave_days_per_year'
-    min_val = df_heat[hw_days_col].min()
-    max_val = df_heat[hw_days_col].max()
-
-    if max_val > min_val:
-        df_heat['heatwave_risk'] = (df_heat[hw_days_col] - min_val) / (max_val - min_val)
-    else:
-        df_heat['heatwave_risk'] = 0.0
-
-    logger.info(f"Computed heatwave risk for {len(df_heat)} regions")
-
-    return df_heat[[admin3_id_col, admin3_name_col, 'heatwave_risk',
-                    'mean_heatwave_days_per_year', 'mean_max_3day_T_C']]
-
-
-def calculate_heatwave_risk_incremental(
-    loader: 'ClimateDataLoader',
-    admin3_gdf: gpd.GeoDataFrame,
-    config: Dict,
-    detected_columns: Dict[str, str]
-) -> pd.DataFrame:
-    """Memory-efficient heatwave risk calculation processing files one at a time.
-
-    This function processes daily temperature files incrementally to avoid
-    loading all data into memory at once.
-
-    Args:
-        loader: ClimateDataLoader instance with classified files.
-        admin3_gdf: GeoDataFrame with admin-3 boundaries.
-        config: Configuration dictionary.
-        detected_columns: Dict mapping standard names to actual column names.
-
-    Returns:
-        DataFrame with columns: admin3_id, admin3_name, heatwave_risk (0-1)
-    """
-    logger.info("Calculating heatwave risk (incremental mode)...")
-
-    lat_col = detected_columns.get('latitude')
-    lon_col = detected_columns.get('longitude')
-    date_col = detected_columns.get('date')
-    temp_col = detected_columns.get('temperature')
-    admin3_id_col = config['admin3_id_column']
-    admin3_name_col = config['admin3_name_column']
-    hw_threshold = config['heatwave_threshold_c']
-
-    # Ensure admin3 is in correct CRS
-    if admin3_gdf.crs is None or admin3_gdf.crs.to_epsg() != 4326:
-        admin3_gdf = admin3_gdf.to_crs(epsg=4326)
-
-    # Build cell-to-region lookup from first file
-    cell_region_lookup = None
-
-    # Region accumulators (persist across all files)
-    region_stats = defaultdict(lambda: {
-        'heatwave_days_total': 0,
-        'years_with_data': set(),  # Use set to track unique years
-        'max3day_list': [],
-    })
-
-    files_processed = 0
-
-    for filename, df in loader.iter_daily_temp_files():
-        if temp_col is None:
-            # Auto-detect from first file
-            for col in df.columns:
-                if 't2m' in col.lower() or 'temp' in col.lower():
-                    temp_col = col
-                    detected_columns['temperature'] = temp_col
-                    break
-
-        if temp_col is None or temp_col not in df.columns:
-            logger.warning(f"No temperature column found in {filename}, skipping")
-            continue
-
-        # Build cell-region lookup once from first file's coordinates
-        if cell_region_lookup is None:
-            cells = df[[lat_col, lon_col]].drop_duplicates().reset_index(drop=True)
-            gdf_cells = gpd.GeoDataFrame(
-                cells,
-                geometry=gpd.points_from_xy(cells[lon_col], cells[lat_col]),
-                crs="EPSG:4326"
-            )
-
-            gdf_join = gpd.sjoin(
-                gdf_cells,
-                admin3_gdf[[admin3_id_col, admin3_name_col, 'geometry']],
-                how="inner",
-                predicate="within"
-            )
-
-            cell_region_lookup = gdf_join[[lat_col, lon_col, admin3_id_col, admin3_name_col]].copy()
-            logger.info(f"Built cell-region lookup: {len(cell_region_lookup)} cells mapped to regions")
-
-        # Parse dates and merge with region lookup
-        df[date_col] = pd.to_datetime(df[date_col])
-        df = df.merge(cell_region_lookup, on=[lat_col, lon_col], how='inner')
-
-        if df.empty:
-            continue
-
-        df['year'] = df[date_col].dt.year
-        years = sorted(df['year'].unique())
-
-        # Process each year in this file
-        for year in years:
-            df_year = df[df['year'] == year].copy()
-            if df_year.empty:
-                continue
-
-            # Region-mean daily max temperature
-            reg_day = (
-                df_year.groupby([admin3_id_col, admin3_name_col, date_col], as_index=False)[temp_col]
-                .mean()
-                .rename(columns={temp_col: 'tmax_reg_C'})
-            )
-
-            # Count heatwave days (temp > threshold)
-            hw_mask = reg_day['tmax_reg_C'] > hw_threshold
-            hw_days = (
-                reg_day[hw_mask]
-                .groupby([admin3_id_col, admin3_name_col], as_index=False)[date_col]
-                .nunique()
-                .rename(columns={date_col: 'heatwave_days_year'})
-            )
-            hw_days_dict = {
-                (row[admin3_id_col], row[admin3_name_col]): int(row['heatwave_days_year'])
-                for _, row in hw_days.iterrows()
-            }
-
-            # Max 3-day rolling mean per region
-            max3day_this_year = {}
-            for (gid, name), df_reg in reg_day.groupby([admin3_id_col, admin3_name_col], sort=False):
-                s = df_reg.sort_values(date_col).set_index(date_col)['tmax_reg_C']
-                if len(s) < 3:
-                    continue
-                roll3 = s.rolling(window=3, min_periods=3).mean()
-                max_val = float(roll3.max())
-                if np.isfinite(max_val):
-                    max3day_this_year[(gid, name)] = max_val
-
-            # Update accumulators
-            regions_in_year = set(
-                tuple(x) for x in reg_day[[admin3_id_col, admin3_name_col]].drop_duplicates().values
-            )
-
-            for key in regions_in_year:
-                gid, name = key
-                stats = region_stats[key]
-                stats['heatwave_days_total'] += hw_days_dict.get(key, 0)
-                stats['years_with_data'].add(year)
-                if key in max3day_this_year:
-                    stats['max3day_list'].append(max3day_this_year[key])
-
-        files_processed += 1
-        # Free memory after processing each file
-        del df
-
-    logger.info(f"Processed {files_processed} daily temperature files")
-
-    if not region_stats:
-        logger.warning("No heatwave stats computed")
-        return pd.DataFrame(columns=[admin3_id_col, admin3_name_col, 'heatwave_risk'])
-
-    # Build stats DataFrame
-    rows = []
-    for (gid, name), stats in region_stats.items():
-        years_count = len(stats['years_with_data'])
-        if years_count == 0:
-            mean_hw_days = 0
-            mean_max3day = 0
-        else:
-            mean_hw_days = stats['heatwave_days_total'] / years_count
-            mean_max3day = (
-                float(np.mean(stats['max3day_list']))
-                if stats['max3day_list'] else 0
-            )
-
-        rows.append({
-            admin3_id_col: gid,
-            admin3_name_col: name,
-            'mean_heatwave_days_per_year': mean_hw_days,
-            'mean_max_3day_T_C': mean_max3day,
-            'years_with_data': years_count,
-        })
-
-    df_heat = pd.DataFrame(rows)
-
-    if df_heat.empty:
-        logger.warning("No heatwave stats computed")
-        return pd.DataFrame(columns=[admin3_id_col, admin3_name_col, 'heatwave_risk'])
-
-    # Normalize to 0-1 risk score
-    hw_days_col = 'mean_heatwave_days_per_year'
-    min_val = df_heat[hw_days_col].min()
-    max_val = df_heat[hw_days_col].max()
-
-    if max_val > min_val:
-        df_heat['heatwave_risk'] = (df_heat[hw_days_col] - min_val) / (max_val - min_val)
-    else:
-        df_heat['heatwave_risk'] = 0.0
-
-    logger.info(f"Computed heatwave risk for {len(df_heat)} regions")
-
-    return df_heat[[admin3_id_col, admin3_name_col, 'heatwave_risk',
-                    'mean_heatwave_days_per_year', 'mean_max_3day_T_C']]
-
-
-# =============================================================================
-# SPI DROUGHT RISK CALCULATION
-# =============================================================================
-
-def _compute_spi_for_cell(
-    df_cell: pd.DataFrame,
-    date_col: str,
-    precip_col: str,
-    scale: int,
-    baseline_start: int,
-    baseline_end: int,
-    baseline_params: Optional[Dict[int, Tuple[float, float, float]]] = None,
-) -> pd.DataFrame:
-    """Compute SPI-k for one grid cell.
-
-    Args:
-        df_cell: DataFrame for one cell with date and precipitation columns.
-        date_col: Name of date column.
-        precip_col: Name of precipitation column.
-        scale: SPI accumulation period in months.
-        baseline_start: Start year for gamma distribution fitting.
-        baseline_end: End year for gamma distribution fitting.
-
-    Returns:
-        DataFrame with: date, year, month, P_k, spi
-    """
-    df = df_cell.sort_values(date_col).copy()
-
-    # Drop duplicate dates (keep first occurrence), then set index
-    df = df.drop_duplicates(subset=[date_col], keep='first')
-    df = df.set_index(date_col)
-
-    # Full continuous monthly index
-    full_index = pd.date_range(df.index.min(), df.index.max(), freq='MS')
-    df = df.reindex(full_index)
-
-    # Fill missing precip with 0 mm
-    df[precip_col] = df[precip_col].fillna(0.0)
-    df['year'] = df.index.year
-    df['month'] = df.index.month
-
-    # k-month rolling accumulation
-    df['P_k'] = df[precip_col].rolling(window=scale, min_periods=scale).sum()
-    df['spi'] = np.nan
-
-    # Compute SPI separately for each calendar month
-    for m in range(1, 13):
-        mask_month = df['month'] == m
-        if not mask_month.any():
-            continue
-
-        series = df.loc[mask_month, 'P_k']
-
-        if baseline_params is not None and m in baseline_params:
-            shape, scale_param, q = baseline_params[m]
-        else:
-            # Fallback to cell-specific baseline subset for fitting
-            baseline_mask = (
-                mask_month &
-                (df['year'] >= baseline_start) &
-                (df['year'] <= baseline_end)
-            )
-            baseline_values = df.loc[baseline_mask, 'P_k'].dropna()
-
-            if len(baseline_values) < 10:
-                continue
-
-            positive = baseline_values[baseline_values > 0]
-            if len(positive) < 2:
-                continue
-
-            # Gamma fit: shape, loc=0, scale
-            try:
-                shape, loc, scale_param = gamma.fit(positive, floc=0)
-            except Exception:
-                continue
-
-            q = len(positive) / len(baseline_values)  # non-zero probability
-
-        x = series.values
-        x_clipped = np.maximum(x, 0.0001)
-
-        G = gamma.cdf(x_clipped, shape, loc=0, scale=scale_param)
-
-        # Mixed distribution: mass at zero
-        H = (1.0 - q) + q * G
-        H[x <= 0] = (1.0 - q)
-
-        H = np.clip(H, 1e-6, 1 - 1e-6)
-        spi_vals = norm.ppf(H)
-
-        df.loc[series.index, 'spi'] = spi_vals
-
-    df = df.dropna(subset=['P_k', 'spi']).reset_index().rename(columns={'index': 'date'})
-    return df[['date', 'year', 'month', 'P_k', 'spi']]
-
-
-def _fit_countrywide_spi_baseline(
-    climate_df: pd.DataFrame,
-    lat_col: str,
-    lon_col: str,
-    date_col: str,
-    precip_col: str,
-    scale: int,
-    baseline_start: int,
-    baseline_end: int,
-) -> Dict[int, Tuple[float, float, float]]:
-    """Fit month-wise SPI baseline parameters using all cells countrywide.
-
-    Returns a dict mapping month -> (shape, scale_param, q_nonzero).
-    """
-    df = climate_df[[lat_col, lon_col, date_col, precip_col]].copy()
-    df = df.sort_values([lat_col, lon_col, date_col])
-    df['year'] = df[date_col].dt.year
-    df['month'] = df[date_col].dt.month
-
-    # Build SPI-k precipitation sums for each cell using available monthly sequence.
-    df['P_k'] = (
-        df.groupby([lat_col, lon_col], sort=False)[precip_col]
-        .transform(lambda s: s.rolling(window=scale, min_periods=scale).sum())
-    )
-
-    baseline_mask = (df['year'] >= baseline_start) & (df['year'] <= baseline_end)
-    baseline_df = df.loc[baseline_mask, ['month', 'P_k']].dropna()
-
-    baseline_params: Dict[int, Tuple[float, float, float]] = {}
-    for m in range(1, 13):
-        vals = baseline_df.loc[baseline_df['month'] == m, 'P_k']
-        if len(vals) < 10:
-            continue
-
-        positive = vals[vals > 0]
-        if len(positive) < 2:
-            continue
-
-        try:
-            shape, loc, scale_param = gamma.fit(positive, floc=0)
-        except Exception:
-            continue
-
-        q = len(positive) / len(vals)
-        baseline_params[m] = (shape, scale_param, q)
-
-    return baseline_params
-
-
-def calculate_spi_drought_risk(
-    climate_df: pd.DataFrame,
-    admin3_gdf: gpd.GeoDataFrame,
-    config: Dict,
-    detected_columns: Dict[str, str]
-) -> pd.DataFrame:
-    """Calculate SPI-based drought risk scores per admin-3 region.
-
-    This function:
-    1. Computes SPI-k (Standardized Precipitation Index) per grid cell
-    2. Aggregates to admin-3 regions
-    3. Counts drought years by intensity category
-    4. Produces normalized risk score (0-1)
-
-    Args:
-        climate_df: DataFrame with monthly precipitation data.
-        admin3_gdf: GeoDataFrame with admin-3 boundaries.
-        config: Configuration dictionary.
-        detected_columns: Dict mapping standard names to actual column names.
-
-    Returns:
-        DataFrame with columns: admin3_id, admin3_name, drought_risk (0-1)
-    """
-    logger.info("Calculating SPI drought risk...")
-
-    lat_col = detected_columns.get('latitude')
-    lon_col = detected_columns.get('longitude')
-    date_col = detected_columns.get('date')
-    precip_col = detected_columns.get('precipitation')
-    admin3_id_col = config['admin3_id_column']
-    admin3_name_col = config['admin3_name_column']
-
-    if precip_col is None or precip_col not in climate_df.columns:
-        logger.warning("No precipitation column found, skipping drought calculation")
-        return pd.DataFrame(columns=[admin3_id_col, admin3_name_col, 'drought_risk'])
-
-    # Parse dates
-    df = climate_df.copy()
-
-    # Check if date column exists; if not, try to construct from year/month columns
-    if date_col is not None and date_col in df.columns:
-        df[date_col] = pd.to_datetime(df[date_col])
-        if 'year' not in df.columns:
-            df['year'] = df[date_col].dt.year
-        if 'month' not in df.columns:
-            df['month'] = df[date_col].dt.month
-    elif 'year' in df.columns and 'month' in df.columns:
-        # Construct date from year and month columns
-        logger.info("No date column found, constructing from year/month columns")
-        df['date'] = pd.to_datetime(df[['year', 'month']].assign(day=1))
-        date_col = 'date'
-        detected_columns['date'] = 'date'
-    else:
-        logger.warning("No date column and no year/month columns found, skipping drought calculation")
-        return pd.DataFrame(columns=[admin3_id_col, admin3_name_col, 'drought_risk'])
-
-    # Compute SPI per grid cell
-    spi_scale = int(config['spi_scale'])
-    baseline_start = int(config['spi_baseline_start'])
-    baseline_end = int(config['spi_baseline_end'])
-
-    # Fit a countrywide monthly SPI baseline (shared across all cells).
-    baseline_params = _fit_countrywide_spi_baseline(
-        climate_df=df,
-        lat_col=lat_col,
-        lon_col=lon_col,
-        date_col=date_col,
-        precip_col=precip_col,
-        scale=spi_scale,
-        baseline_start=baseline_start,
-        baseline_end=baseline_end,
-    )
-    if baseline_params:
-        logger.info(
-            f"Using countrywide SPI baseline from {baseline_start} to {baseline_end} "
-            f"for months: {sorted(baseline_params.keys())}"
-        )
-    else:
-        logger.warning(
-            "Could not fit countrywide SPI baseline; falling back to cell-specific baseline fitting"
-        )
-
-    grouped_cells = df.groupby([lat_col, lon_col], sort=False)
-    logger.info(f"Computing SPI-{spi_scale} for {len(grouped_cells)} grid cells...")
-
-    cell_rows = []
-    for (lat, lon), df_cell in grouped_cells:
-        spi_df = _compute_spi_for_cell(
-            df_cell, date_col, precip_col,
-            spi_scale, baseline_start, baseline_end,
-            baseline_params=baseline_params if baseline_params else None,
-        )
-        if spi_df.empty:
-            continue
-        spi_df[lat_col] = lat
-        spi_df[lon_col] = lon
-        cell_rows.append(spi_df)
-
-    if not cell_rows:
-        logger.warning("No SPI computed for any cell")
-        return pd.DataFrame(columns=[admin3_id_col, admin3_name_col, 'drought_risk'])
-
-    cell_spi = pd.concat(cell_rows, ignore_index=True)
-    logger.info(f"Total SPI records (cell-level): {len(cell_spi):,}")
-
-    # Spatial join to admin-3
-    gdf_cells = gpd.GeoDataFrame(
-        cell_spi,
-        geometry=gpd.points_from_xy(cell_spi[lon_col], cell_spi[lat_col]),
-        crs="EPSG:4326"
-    )
-
-    if admin3_gdf.crs is None or admin3_gdf.crs.to_epsg() != 4326:
-        admin3_gdf = admin3_gdf.to_crs(epsg=4326)
-
-    gdf_join = gpd.sjoin(
-        gdf_cells,
-        admin3_gdf[[admin3_id_col, admin3_name_col, 'geometry']],
-        how="inner",
-        predicate="within"
-    )
-
-    # Aggregate to region-month (mean over cells)
-    df_reg_month = (
-        gdf_join
-        .groupby([admin3_id_col, admin3_name_col, 'date'], as_index=False)['spi']
-        .mean()
-        .rename(columns={'spi': 'spi_region_mean'})
-    )
-    df_reg_month['year'] = df_reg_month['date'].dt.year
-
-    # Get thresholds
-    drought_threshold = config['spi_drought_threshold']
-    mild_threshold = config['spi_mild_threshold']
-    moderate_threshold = config['spi_moderate_threshold']
-    severe_threshold = config['spi_severe_threshold']
-
-    # Calculate drought stats per region
-    regions = admin3_gdf[[admin3_id_col, admin3_name_col]].drop_duplicates().reset_index(drop=True)
-
-    stats_rows = []
-    for _, reg in regions.iterrows():
-        gid = reg[admin3_id_col]
-        name = reg[admin3_name_col]
-
-        df_r = df_reg_month[df_reg_month[admin3_id_col] == gid].copy()
-        if df_r.empty:
-            stats_rows.append({
-                admin3_id_col: gid,
-                admin3_name_col: name,
-                'years_with_data': 0,
-                'drought_years_total': 0,
-                'frac_drought_years': 0,
-            })
-            continue
-
-        years_present = sorted(df_r['year'].unique())
-        drought_years = 0
-
-        for year in years_present:
-            df_y = df_r[df_r['year'] == year]
-            if df_y.empty:
-                continue
-
-            min_spi = df_y['spi_region_mean'].min()
-            if np.isnan(min_spi):
-                continue
-
-            if min_spi <= drought_threshold:
-                drought_years += 1
-
-        years_with_data = len(years_present)
-        frac_drought = drought_years / years_with_data if years_with_data > 0 else 0
-
-        stats_rows.append({
-            admin3_id_col: gid,
-            admin3_name_col: name,
-            'years_with_data': years_with_data,
-            'drought_years_total': drought_years,
-            'frac_drought_years': frac_drought,
-        })
-
-    df_stats = pd.DataFrame(stats_rows)
-
-    if df_stats.empty:
-        logger.warning("No drought stats computed")
-        return pd.DataFrame(columns=[admin3_id_col, admin3_name_col, 'drought_risk'])
-
-    # Normalize to 0-1 risk score using min-max normalization
-    # NOTE: Using min-max normalization. Consider revisiting for percentile-based approach.
-    min_val = df_stats['frac_drought_years'].min()
-    max_val = df_stats['frac_drought_years'].max()
-
-    if max_val > min_val:
-        df_stats['drought_risk'] = (df_stats['frac_drought_years'] - min_val) / (max_val - min_val)
-    else:
-        df_stats['drought_risk'] = 0.0
-
-    logger.info(f"Computed drought risk for {len(df_stats)} regions")
-
-    return df_stats[[admin3_id_col, admin3_name_col, 'drought_risk',
-                     'drought_years_total', 'frac_drought_years']]
 
 
 # =============================================================================
